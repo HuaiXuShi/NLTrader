@@ -8,3 +8,8 @@ __pycache__/
 .venv/
 venv/
 *.pyc
+nltrader_parser_contract_docs
+docs
+scripts
+AGENTS.md
+qlib_bin.tar.gz
