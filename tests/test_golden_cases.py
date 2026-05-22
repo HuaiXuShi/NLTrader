@@ -3,9 +3,8 @@ import pytest
 
 from src.compiler import compile_strategy
 from src.config import Settings
-from src.dsl import ValidationError
 from src.models import BacktestResult, MarketState, ParseResult, PortfolioState
-from src.parser import StrategyParser
+from src.parser import LLMOutputContractError, StrategyParser
 from src.pipeline import run_backtest_pipeline
 from src.qlib_strategy_adapter import QlibTargetWeightStrategy
 
@@ -37,14 +36,27 @@ class StaticParser:
         return self.result
 
 
-def test_case_1_real_llm_parser_single_stock_ma_compiles_with_injected_evaluator():
-    evaluator = FakeEvaluator()
+class RaisingParser:
+    def __init__(self, exc):
+        self.exc = exc
+        self.calls = []
 
-    result = _run_real_llm_pipeline_with_retry(
+    def parse(self, text, *, fallback=True):
+        self.calls.append({"text": text, "fallback": fallback})
+        raise self.exc
+
+
+def test_case_1_static_parser_single_stock_ma_compiles_with_injected_evaluator():
+    evaluator = FakeEvaluator()
+    parser = StaticParser(_valid_timeseries_parse_result())
+
+    result = run_backtest_pipeline(
         "针对招商银行600036，5日均线上穿20日均线买入，跌破10日均线卖出。",
         "2021-01-01",
         "2021-03-31",
-        evaluator,
+        parser=parser,
+        evaluator=evaluator,
+        fallback=False,
     )
 
     assert result.status == "ok"
@@ -55,16 +67,25 @@ def test_case_1_real_llm_parser_single_stock_ma_compiles_with_injected_evaluator
     assert hasattr(result.compiled_strategy, "generate_target_weights")
     assert len(evaluator.calls) == 1
     assert evaluator.calls[0]["universe_spec"].symbols == ["SH600036"]
+    assert parser.calls == [
+        {
+            "text": "针对招商银行600036，5日均线上穿20日均线买入，跌破10日均线卖出。",
+            "fallback": False,
+        }
+    ]
 
 
-def test_case_2_real_llm_parser_stop_loss_uses_injected_evaluator():
+def test_case_2_static_parser_stop_loss_uses_injected_evaluator():
     evaluator = FakeEvaluator()
+    parser = StaticParser(_valid_timeseries_stop_loss_parse_result())
 
-    result = _run_real_llm_pipeline_with_retry(
+    result = run_backtest_pipeline(
         "针对招商银行600036，5日均线上穿20日均线买入，亏损8%卖出。",
         "2021-01-01",
         "2021-03-31",
-        evaluator,
+        parser=parser,
+        evaluator=evaluator,
+        fallback=False,
     )
 
     assert result.status == "ok"
@@ -102,26 +123,31 @@ def test_case_2_real_llm_parser_stop_loss_uses_injected_evaluator():
     assert weights == {}
 
 
-def test_case_3_real_llm_parser_fuzzy_volume_reports_uncertainty_with_injected_evaluator():
-    result = _run_real_llm_pipeline_with_retry(
+def test_case_3_static_parser_fuzzy_volume_reports_uncertainty_with_injected_evaluator():
+    result = run_backtest_pipeline(
         "针对招商银行600036，放量上涨时买入，趋势破了就卖。",
         "2021-01-01",
         "2021-03-31",
-        FakeEvaluator(),
+        parser=StaticParser(_fuzzy_volume_parse_result()),
+        evaluator=FakeEvaluator(),
+        fallback=False,
     )
 
     assert result.parse_result.assumptions or result.parse_result.warnings or result.warnings
 
 
-def test_case_4_real_llm_parser_monthly_momentum_top_n_symbol_pool_uses_injected_evaluator():
+def test_case_4_static_parser_monthly_momentum_top_n_symbol_pool_uses_injected_evaluator():
     evaluator = FakeEvaluator()
+    parser = StaticParser(_valid_cross_sectional_top_n_parse_result())
 
-    result = _run_real_llm_pipeline_with_retry(
+    result = run_backtest_pipeline(
         "每月调仓，在股票池600036、000001、600519、000858、300750、002415、601318、601888、"
         "600030、601166、000333、600900中选择过去20日涨幅最高的10只股票等权持有。",
         "2021-01-01",
         "2021-06-30",
-        evaluator,
+        parser=parser,
+        evaluator=evaluator,
+        fallback=False,
     )
 
     dsl = result.parse_result.dsl
@@ -133,17 +159,25 @@ def test_case_4_real_llm_parser_monthly_momentum_top_n_symbol_pool_uses_injected
     assert dsl["selection"]["top_n"] == 10
     assert dsl["construction"]["weighting"] == "equal_weight"
     assert len(evaluator.calls) == 1
+    assert parser.calls == [
+        {
+            "text": "每月调仓，在股票池600036、000001、600519、000858、300750、002415、601318、601888、600030、601166、000333、600900中选择过去20日涨幅最高的10只股票等权持有。",
+            "fallback": False,
+        }
+    ]
 
 
-def test_case_5_real_llm_missing_universe_does_not_run_evaluator():
+def test_case_5_static_parser_missing_universe_does_not_run_evaluator():
     evaluator = FakeEvaluator()
+    parser = StaticParser(_unsupported_missing_universe_parse_result())
 
-    result = _run_real_llm_pipeline_with_retry(
+    result = run_backtest_pipeline(
         "每月选过去20日涨幅最高的10只股票等权持有。",
         "2021-01-01",
         "2021-06-30",
-        evaluator,
-        retry_statuses=(),
+        parser=parser,
+        evaluator=evaluator,
+        fallback=False,
     )
 
     warnings = " ".join(result.warnings + result.parse_result.warnings)
@@ -152,13 +186,8 @@ def test_case_5_real_llm_missing_universe_does_not_run_evaluator():
         for keyword in ("universe", "股票池", "pool", "范围", "未明确", "缺少")
     )
 
-    if result.status == "ok":
-        universe = result.parse_result.dsl["universe"]
-        assert explicit_warning, "implicit universe must be explicitly warned"
-        assert universe["type"] != "preset_pool", "must not invent a hidden preset pool"
-    else:
-        assert result.status in {"unsupported", "validation_error"}
-        assert explicit_warning
+    assert result.status in {"unsupported", "validation_error"}
+    assert explicit_warning
     assert evaluator.calls == []
 
 
@@ -252,6 +281,26 @@ def test_case_9_api_failure_fallback_has_explicit_warning():
     assert any("fallback" in warning.lower() for warning in result.warnings)
 
 
+def test_case_9b_parser_contract_error_returns_validation_error_without_running_evaluator():
+    evaluator = FakeEvaluator()
+    parser = RaisingParser(LLMOutputContractError("LLM output failed parser contract after repair"))
+
+    result = run_backtest_pipeline(
+        "招商银行600036，5日均线上穿20日均线买入。",
+        "2021-01-01",
+        "2021-03-31",
+        parser=parser,
+        evaluator=evaluator,
+        fallback=True,
+    )
+
+    assert result.status == "validation_error"
+    assert result.parse_result.strategy_kind == "unsupported"
+    assert result.parse_result.dsl == {}
+    assert evaluator.calls == []
+    assert any("after repair" in warning for warning in result.warnings)
+
+
 def test_case_10_timeseries_and_cross_sectional_share_qlib_target_weight_adapter():
     provider = AdapterFakeProvider()
     timeseries_strategy = compile_strategy(_valid_timeseries_parse_result().dsl)
@@ -322,35 +371,6 @@ class AdapterFakeProvider:
         return pd.DataFrame(rows)
 
 
-def _run_real_llm_pipeline_with_retry(
-    text,
-    start,
-    end,
-    evaluator,
-    attempts=3,
-    retry_statuses=("validation_error", "unsupported"),
-):
-    last_error = None
-    last_result = None
-    for _ in range(attempts):
-        try:
-            result = run_backtest_pipeline(
-                text,
-                start,
-                end,
-                evaluator=evaluator,
-                fallback=False,
-            )
-            if result.status not in retry_statuses:
-                return result
-            last_result = result
-        except (RuntimeError, ValueError, ValidationError) as exc:
-            last_error = exc
-    if last_result is not None:
-        return last_result
-    raise last_error
-
-
 def _backtest_result(capability_summary=None):
     return BacktestResult(
         capability_summary=capability_summary or {"provider_uri": "/fake/qlib"},
@@ -387,6 +407,19 @@ def _valid_timeseries_parse_result():
     )
 
 
+def _valid_timeseries_stop_loss_parse_result():
+    result = _valid_timeseries_parse_result()
+    result.dsl["risk"] = {"stop_loss": 0.08}
+    return result
+
+
+def _fuzzy_volume_parse_result():
+    result = _valid_timeseries_parse_result()
+    result.assumptions = ["将'放量上涨'近似为价格趋势确认。"]
+    result.warnings = ["原始描述存在模糊性，已做保守解释。"]
+    return result
+
+
 def _valid_cross_sectional_parse_result():
     return ParseResult(
         dsl={
@@ -404,4 +437,48 @@ def _valid_cross_sectional_parse_result():
             "construction": {"weighting": "equal_weight"},
         },
         strategy_kind="cross_sectional",
+    )
+
+
+def _valid_cross_sectional_top_n_parse_result():
+    return ParseResult(
+        dsl={
+            "strategy_kind": "cross_sectional",
+            "market": "CN_A",
+            "frequency": "D",
+            "universe": {
+                "type": "symbol_list",
+                "symbols": [
+                    "SH600036",
+                    "SZ000001",
+                    "SH600519",
+                    "SZ000858",
+                    "SZ300750",
+                    "SZ002415",
+                    "SH601318",
+                    "SH601888",
+                    "SH600030",
+                    "SH601166",
+                    "SZ000333",
+                    "SH600900",
+                ],
+            },
+            "rebalance": {"freq": "monthly"},
+            "selection": {
+                "filters": [],
+                "score": {"factor": "RETURN_N", "params": [20]},
+                "rank_order": "desc",
+                "top_n": 10,
+            },
+            "construction": {"weighting": "equal_weight"},
+        },
+        strategy_kind="cross_sectional",
+    )
+
+
+def _unsupported_missing_universe_parse_result():
+    return ParseResult(
+        dsl={},
+        strategy_kind="unsupported",
+        warnings=["缺少明确股票池或 universe，无法执行横截面选股。"],
     )

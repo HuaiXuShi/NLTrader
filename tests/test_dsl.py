@@ -92,6 +92,91 @@ def test_validate_cross_sectional_dsl_accepts_sma_gap_score_factor():
     assert validated["selection"]["score"]["factor"] == "SMA_GAP"
 
 
+def test_validate_dsl_accepts_risk_stop_loss_ratio_and_normalizes_to_float():
+    dsl = {
+        "strategy_kind": "timeseries",
+        "market": "CN_A",
+        "frequency": "D",
+        "universe": {"type": "single_symbol", "symbols": ["600036.SH"]},
+        "rebalance": {"freq": "daily"},
+        "risk": {"stop_loss": 0.08},
+        "signal": {
+            "entry_rules": [
+                {
+                    "lhs": {"indicator": "SMA", "params": [5]},
+                    "op": ">",
+                    "rhs": {"value": 1},
+                }
+            ],
+            "exit_rules": [],
+        },
+    }
+
+    validated = validate_dsl(dsl)
+
+    assert validated["risk"]["stop_loss"] == 0.08
+    assert isinstance(validated["risk"]["stop_loss"], float)
+
+
+@pytest.mark.parametrize(
+    ("stop_loss", "message"),
+    [
+        ({"type": "percent", "value": 8}, "risk.stop_loss must be a numeric ratio"),
+        ("8%", "risk.stop_loss must be a numeric ratio"),
+        (True, "risk.stop_loss must be a numeric ratio"),
+        (-0.08, "risk.stop_loss must be between 0 and 1"),
+        (8, "risk.stop_loss must be between 0 and 1"),
+        (1, "risk.stop_loss must be between 0 and 1"),
+    ],
+)
+def test_validate_dsl_rejects_invalid_risk_stop_loss_values(stop_loss, message):
+    with pytest.raises(ValidationError, match=message):
+        validate_dsl(
+            {
+                "strategy_kind": "timeseries",
+                "market": "CN_A",
+                "frequency": "D",
+                "universe": {"type": "single_symbol", "symbols": ["600036.SH"]},
+                "rebalance": {"freq": "daily"},
+                "risk": {"stop_loss": stop_loss},
+                "signal": {
+                    "entry_rules": [
+                        {
+                            "lhs": {"indicator": "SMA", "params": [5]},
+                            "op": ">",
+                            "rhs": {"value": 1},
+                        }
+                    ],
+                    "exit_rules": [],
+                },
+            }
+        )
+
+
+def test_validate_dsl_rejects_unknown_risk_fields():
+    with pytest.raises(ValidationError, match=r"unsupported risk fields: \['max_drawdown'\]"):
+        validate_dsl(
+            {
+                "strategy_kind": "timeseries",
+                "market": "CN_A",
+                "frequency": "D",
+                "universe": {"type": "single_symbol", "symbols": ["600036.SH"]},
+                "rebalance": {"freq": "daily"},
+                "risk": {"max_drawdown": 0.1},
+                "signal": {
+                    "entry_rules": [
+                        {
+                            "lhs": {"indicator": "SMA", "params": [5]},
+                            "op": ">",
+                            "rhs": {"value": 1},
+                        }
+                    ],
+                    "exit_rules": [],
+                },
+            }
+        )
+
+
 @pytest.mark.parametrize(
     "patch",
     [

@@ -60,6 +60,9 @@ def validate_dsl(dsl: Mapping[str, Any]) -> dict[str, Any]:
     _require_supported(validated, "frequency", SUPPORTED_FREQUENCIES, "frequency")
     _validate_rebalance(validated.get("rebalance", {}))
 
+    if "risk" in validated:
+        validated["risk"] = _validate_risk(validated["risk"])
+
     if "universe" in validated:
         validated["universe"] = validate_universe(validated["universe"])
 
@@ -249,6 +252,30 @@ def _validate_rebalance(rebalance: Any) -> None:
     _require_supported(
         rebalance, "freq", SUPPORTED_REBALANCE_FREQUENCIES, "rebalance frequency"
     )
+
+
+def _validate_risk(risk: Any) -> dict[str, Any]:
+    if not isinstance(risk, Mapping):
+        raise ValidationError("risk must be a mapping")
+
+    validated = dict(risk)
+    unknown = set(validated) - {"stop_loss"}
+    if unknown:
+        raise ValidationError(f"unsupported risk fields: {sorted(unknown)}")
+
+    if "stop_loss" not in validated or validated["stop_loss"] is None:
+        return validated
+
+    stop_loss = validated["stop_loss"]
+    if isinstance(stop_loss, bool) or not isinstance(stop_loss, (int, float)):
+        raise ValidationError("risk.stop_loss must be a numeric ratio")
+
+    stop_loss_float = float(stop_loss)
+    if not 0 < stop_loss_float < 1:
+        raise ValidationError("risk.stop_loss must be between 0 and 1")
+
+    validated["stop_loss"] = stop_loss_float
+    return validated
 
 
 def _require_supported(
