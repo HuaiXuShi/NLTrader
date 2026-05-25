@@ -1,6 +1,11 @@
 import pandas as pd
 import pytest
 
+pytest.importorskip(
+    "qlib.strategy.base",
+    reason="Qlib strategy integration tests require qlib to be installed",
+)
+
 from src.dsl import ValidationError
 from src.models import UniverseSpec
 from src.qlib_evaluator import QlibEvaluator

@@ -11,6 +11,7 @@ from src.parser import (
     LLMOutputContractError,
     LLMResponseFormatUnsupportedError,
     StrategyParser,
+    _looks_like_schema_unsupported,
     _build_system_prompt,
     _build_user_prompt,
     _build_repair_prompt,
@@ -48,6 +49,36 @@ class FakeSchemaAwareLLMClient:
         return response
 
 
+def wire_response(
+    dsl: dict[str, object],
+    strategy_kind: str,
+    *,
+    assumptions: list[str] | None = None,
+    warnings: list[str] | None = None,
+    human_summary: str = "",
+) -> str:
+    return json.dumps(
+        {
+            "dsl_json": json.dumps(dsl, ensure_ascii=False),
+            "strategy_kind": strategy_kind,
+            "assumptions": assumptions or [],
+            "warnings": warnings or [],
+            "human_summary": human_summary,
+        },
+        ensure_ascii=False,
+    )
+
+
+def _assert_no_additional_properties_true(schema: object) -> None:
+    if isinstance(schema, dict):
+        assert schema.get("additionalProperties") is not True
+        for value in schema.values():
+            _assert_no_additional_properties_true(value)
+    elif isinstance(schema, list):
+        for item in schema:
+            _assert_no_additional_properties_true(item)
+
+
 def test_parse_llm_draft_from_text_parses_code_fence_json_draft():
     raw = """```json
 {
@@ -64,6 +95,54 @@ def test_parse_llm_draft_from_text_parses_code_fence_json_draft():
     assert isinstance(draft, LLMParseDraft)
     assert draft.strategy_kind == "unsupported"
     assert draft.warnings == ["out of scope"]
+
+
+def test_parse_llm_draft_from_text_parses_strict_wire_dsl_json():
+    dsl = {
+        "strategy_kind": "timeseries",
+        "market": "CN_A",
+        "frequency": "D",
+        "universe": {"type": "single_symbol", "symbols": ["SH600036"]},
+        "rebalance": {"freq": "daily"},
+        "signal": {
+            "entry_rules": [
+                {
+                    "lhs": {"indicator": "SMA", "params": [5]},
+                    "op": "cross_above",
+                    "rhs": {"indicator": "SMA", "params": [20]},
+                }
+            ],
+            "exit_rules": [],
+        },
+    }
+
+    draft = parse_llm_draft_from_text(
+        wire_response(
+            dsl,
+            "timeseries",
+            human_summary="wire draft",
+        )
+    )
+
+    assert isinstance(draft, LLMParseDraft)
+    assert draft.dsl == dsl
+    assert draft.strategy_kind == "timeseries"
+    assert draft.human_summary == "wire draft"
+
+
+def test_parse_llm_draft_from_text_rejects_invalid_dsl_json():
+    raw = json.dumps(
+        {
+            "dsl_json": "{not json}",
+            "strategy_kind": "timeseries",
+            "assumptions": [],
+            "warnings": [],
+            "human_summary": "",
+        }
+    )
+
+    with pytest.raises(LLMOutputContractError, match="dsl_json"):
+        parse_llm_draft_from_text(raw)
 
 
 def test_parse_llm_draft_from_text_rejects_top_level_parse_confidence():
@@ -102,18 +181,49 @@ def test_draft_to_parse_result_uses_parser_owned_confidence():
     assert result.parse_confidence == pytest.approx(0.75)
 
 
-def test_llm_parse_draft_json_schema_requires_all_top_level_fields():
+def test_llm_parse_draft_json_schema_is_strict_output_compatible():
     schema = llm_parse_draft_json_schema()
 
     assert schema["type"] == "object"
     assert schema["additionalProperties"] is False
     assert set(schema["required"]) == {
-        "dsl",
+        "dsl_json",
         "strategy_kind",
         "assumptions",
         "warnings",
         "human_summary",
     }
+    assert set(schema["properties"]) == set(schema["required"])
+    assert schema["properties"]["dsl_json"]["type"] == "string"
+    assert "parse_confidence" not in schema["properties"]
+    assert "dsl" not in schema["properties"]
+
+
+def test_llm_parse_draft_json_schema_has_no_free_objects():
+    _assert_no_additional_properties_true(llm_parse_draft_json_schema())
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "json_schema response_format unsupported",
+        "Invalid schema for response_format 'nltrader_parse_draft'",
+        "In context=('properties','dsl'), 'additionalProperties' is required to be false for response_format",
+        "response_format rejected: strict structured output not supported",
+    ],
+)
+def test_looks_like_schema_unsupported_detects_schema_response_format_errors(body):
+    assert _looks_like_schema_unsupported(400, body)
+
+
+def test_looks_like_schema_unsupported_requires_response_format_context():
+    assert not _looks_like_schema_unsupported(400, "invalid schema in unrelated config")
+    assert not _looks_like_schema_unsupported(
+        401, "response_format json_schema unsupported"
+    )
+    assert not _looks_like_schema_unsupported(
+        500, "response_format json_schema unsupported"
+    )
 
 
 def test_complete_parse_json_falls_back_to_json_object_when_schema_unsupported():
@@ -204,6 +314,125 @@ def test_parse_retries_with_repair_prompt_after_contract_failure():
     assert "修复" in client.calls[1]["user_prompt"]
     assert "strategy_kind mismatch" in client.calls[1]["user_prompt"]
     assert "bad draft" in client.calls[1]["user_prompt"]
+
+
+def test_parse_repairs_bad_stop_loss_object_via_retry():
+    bad_dsl = {
+        "strategy_kind": "timeseries",
+        "market": "CN_A",
+        "frequency": "D",
+        "universe": {"type": "single_symbol", "symbols": ["SH600036"]},
+        "rebalance": {"freq": "daily"},
+        "signal": {
+            "entry_rules": [
+                {
+                    "lhs": {"indicator": "SMA", "params": [5]},
+                    "op": "cross_above",
+                    "rhs": {"indicator": "SMA", "params": [20]},
+                }
+            ],
+            "exit_rules": [],
+        },
+        "risk": {"stop_loss": {"type": "percent", "value": 8}},
+    }
+    fixed_dsl = {
+        "strategy_kind": "timeseries",
+        "market": "CN_A",
+        "frequency": "D",
+        "universe": {"type": "single_symbol", "symbols": ["SH600036"]},
+        "rebalance": {"freq": "daily"},
+        "signal": {
+            "entry_rules": [
+                {
+                    "lhs": {"indicator": "SMA", "params": [5]},
+                    "op": "cross_above",
+                    "rhs": {"indicator": "SMA", "params": [20]},
+                }
+            ],
+            "exit_rules": [],
+        },
+        "risk": {"stop_loss": 0.08},
+    }
+    client = FakeSchemaAwareLLMClient(
+        [
+            wire_response(bad_dsl, "timeseries", human_summary="bad stop loss"),
+            wire_response(fixed_dsl, "timeseries", human_summary="fixed stop loss"),
+        ]
+    )
+    parser = StrategyParser(
+        Settings(llm_api_base=None, llm_api_key=None, llm_model=None),
+        llm_client=client,
+    )
+
+    result = parser.parse(
+        "针对招商银行600036，5日均线上穿20日均线买入，亏损8%止损。",
+        fallback=True,
+    )
+
+    assert result.strategy_kind == "timeseries"
+    assert result.dsl["risk"]["stop_loss"] == pytest.approx(0.08)
+    assert result.parse_confidence == pytest.approx(0.8)
+    assert len(client.calls) == 2
+    assert "risk.stop_loss" in client.calls[1]["user_prompt"]
+
+
+def test_parse_repairs_bad_score_indicator_and_dict_params_via_retry():
+    bad_dsl = {
+        "strategy_kind": "cross_sectional",
+        "market": "CN_A",
+        "frequency": "D",
+        "universe": {
+            "type": "symbol_list",
+            "symbols": ["SH600036", "SZ000001", "SH600519"],
+        },
+        "rebalance": {"freq": "monthly"},
+        "selection": {
+            "filters": [],
+            "score": {"indicator": "RETURN_N", "params": {"n": 20}},
+            "rank_order": "desc",
+            "top_n": 2,
+        },
+        "construction": {"weighting": "equal_weight"},
+    }
+    fixed_dsl = {
+        "strategy_kind": "cross_sectional",
+        "market": "CN_A",
+        "frequency": "D",
+        "universe": {
+            "type": "symbol_list",
+            "symbols": ["SH600036", "SZ000001", "SH600519"],
+        },
+        "rebalance": {"freq": "monthly"},
+        "selection": {
+            "filters": [],
+            "score": {"factor": "RETURN_N", "params": [20]},
+            "rank_order": "desc",
+            "top_n": 2,
+        },
+        "construction": {"weighting": "equal_weight"},
+    }
+    client = FakeSchemaAwareLLMClient(
+        [
+            wire_response(bad_dsl, "cross_sectional", human_summary="bad score"),
+            wire_response(fixed_dsl, "cross_sectional", human_summary="fixed score"),
+        ]
+    )
+    parser = StrategyParser(
+        Settings(llm_api_base=None, llm_api_key=None, llm_model=None),
+        llm_client=client,
+    )
+
+    result = parser.parse(
+        "每月调仓，在股票池600036、000001、600519中选择过去20日涨幅最高的2只股票等权持有。",
+        fallback=True,
+    )
+
+    assert result.strategy_kind == "cross_sectional"
+    assert result.dsl["selection"]["score"] == {"factor": "RETURN_N", "params": [20]}
+    assert result.parse_confidence == pytest.approx(0.8)
+    assert len(client.calls) == 2
+    assert "indicator" in client.calls[1]["user_prompt"]
+    assert "params" in client.calls[1]["user_prompt"]
 
 
 def test_parse_raises_contract_error_after_two_contract_failures_even_with_fallback():
@@ -299,6 +528,23 @@ def test_parse_draft_with_contract_rejects_unsupported_with_non_empty_dsl():
         _parse_draft_with_contract(raw, source_text="不支持的策略")
 
 
+def test_parse_draft_with_contract_rejects_empty_dsl_with_supported_strategy_kind():
+    raw = json.dumps(
+        {
+            "dsl": {},
+            "strategy_kind": "timeseries",
+            "assumptions": [],
+            "warnings": [],
+            "human_summary": "",
+        }
+    )
+
+    with pytest.raises(
+        LLMOutputContractError, match="empty dsl requires strategy_kind='unsupported'"
+    ):
+        _parse_draft_with_contract(raw, source_text="招商银行600036，5日均线上穿20日均线买入。")
+
+
 def test_parse_draft_with_contract_rejects_invented_preset_pool():
     raw = json.dumps(
         {
@@ -363,6 +609,138 @@ def test_parse_draft_with_contract_allows_explicit_preset_pool_mentions(mention)
     assert draft.dsl["universe"]["pool_name"] == "CSI300"
 
 
+@pytest.mark.parametrize("dsl_pool_name", ["CSI300", "csi300", "沪深300", "沪深 300", "HS300"])
+def test_parse_draft_with_contract_allows_preset_pool_output_aliases_when_source_mentions_pool(
+    dsl_pool_name,
+):
+    raw = json.dumps(
+        {
+            "dsl": {
+                "strategy_kind": "cross_sectional",
+                "market": "CN_A",
+                "frequency": "D",
+                "universe": {"type": "preset_pool", "pool_name": dsl_pool_name},
+                "rebalance": {"freq": "monthly"},
+                "selection": {
+                    "filters": [],
+                    "score": {"factor": "RETURN_N", "params": [20]},
+                    "rank_order": "desc",
+                    "top_n": 10,
+                },
+                "construction": {"weighting": "equal_weight"},
+            },
+            "strategy_kind": "cross_sectional",
+            "assumptions": [],
+            "warnings": [],
+            "human_summary": "",
+        }
+    )
+
+    draft = _parse_draft_with_contract(
+        raw,
+        source_text="在沪深300里每月选过去20日涨幅最高的10只股票等权持有。",
+    )
+
+    assert draft.dsl["universe"]["pool_name"] == "CSI300"
+
+
+def test_parse_draft_with_contract_rejects_wrong_preset_pool_even_when_source_mentions_different_pool():
+    raw = json.dumps(
+        {
+            "dsl": {
+                "strategy_kind": "cross_sectional",
+                "market": "CN_A",
+                "frequency": "D",
+                "universe": {"type": "preset_pool", "pool_name": "CSI500"},
+                "rebalance": {"freq": "monthly"},
+                "selection": {
+                    "filters": [],
+                    "score": {"factor": "RETURN_N", "params": [20]},
+                    "rank_order": "desc",
+                    "top_n": 10,
+                },
+                "construction": {"weighting": "equal_weight"},
+            },
+            "strategy_kind": "cross_sectional",
+            "assumptions": [],
+            "warnings": [],
+            "human_summary": "",
+        }
+    )
+
+    with pytest.raises(LLMOutputContractError, match="invented preset_pool"):
+        _parse_draft_with_contract(
+            raw,
+            source_text="在沪深300里每月选过去20日涨幅最高的10只股票等权持有。",
+        )
+
+
+def test_parse_draft_with_contract_rejects_numeric_preset_pool_alias():
+    raw = json.dumps(
+        {
+            "dsl": {
+                "strategy_kind": "cross_sectional",
+                "market": "CN_A",
+                "frequency": "D",
+                "universe": {"type": "preset_pool", "pool_name": "300"},
+                "rebalance": {"freq": "monthly"},
+                "selection": {
+                    "filters": [],
+                    "score": {"factor": "RETURN_N", "params": [20]},
+                    "rank_order": "desc",
+                    "top_n": 10,
+                },
+                "construction": {"weighting": "equal_weight"},
+            },
+            "strategy_kind": "cross_sectional",
+            "assumptions": [],
+            "warnings": [],
+            "human_summary": "",
+        }
+    )
+
+    with pytest.raises(LLMOutputContractError, match="invented preset_pool"):
+        _parse_draft_with_contract(
+            raw,
+            source_text="在沪深300里每月选过去20日涨幅最高的10只股票等权持有。",
+        )
+
+
+def test_parse_draft_with_contract_rejects_numeric_qlib_market_alias():
+    raw = json.dumps(
+        {
+            "dsl": {
+                "strategy_kind": "cross_sectional",
+                "market": "CN_A",
+                "frequency": "D",
+                "universe": {
+                    "type": "preset_pool",
+                    "pool_name": "invented",
+                    "qlib_market": "300",
+                },
+                "rebalance": {"freq": "monthly"},
+                "selection": {
+                    "filters": [],
+                    "score": {"factor": "RETURN_N", "params": [20]},
+                    "rank_order": "desc",
+                    "top_n": 10,
+                },
+                "construction": {"weighting": "equal_weight"},
+            },
+            "strategy_kind": "cross_sectional",
+            "assumptions": [],
+            "warnings": [],
+            "human_summary": "",
+        }
+    )
+
+    with pytest.raises(LLMOutputContractError, match="invented preset_pool"):
+        _parse_draft_with_contract(
+            raw,
+            source_text="在沪深300里每月选过去20日涨幅最高的10只股票等权持有。",
+        )
+
+
 def test_parse_draft_with_contract_rejects_uploaded_pool_without_context():
     raw = json.dumps(
         {
@@ -399,13 +777,17 @@ def test_system_and_user_prompts_include_phase_4_contract_constraints():
     user_prompt = _build_user_prompt("每月选过去20日涨幅最高的10只股票等权持有。")
 
     assert "LLMParseDraft" in system_prompt
+    assert "dsl_json" in system_prompt
+    assert "不要输出 dsl object" in system_prompt
     assert "不要输出 parse_confidence" in system_prompt
     assert "risk.stop_loss 必须是数字比例" in system_prompt
     assert 'selection.score 只能使用 factor 字段和数组 params' in system_prompt
     assert "不要编造用户没有明确给出的股票代码、股票池或指数池" in system_prompt
-    assert '返回 dsl={}, strategy_kind="unsupported"' in system_prompt
+    assert '返回 dsl_json="{}", strategy_kind="unsupported"' in system_prompt
 
     assert "LLMParseDraft 顶层结构" in user_prompt
+    assert "dsl_json" in user_prompt
+    assert "JSON 字符串" in user_prompt
     assert "risk.stop_loss 是数字比例：亏损8% => 0.08" in user_prompt
     assert 'score 必须写为 {"factor":"RETURN_N","params":[20]}' in user_prompt
     assert "如果用户没有给出股票池、股票列表或明确指数池，不要编造 universe" in user_prompt
@@ -431,19 +813,22 @@ def test_repair_prompt_includes_phase_4_contract_constraints():
         validation_error="LLM invented preset_pool not explicitly mentioned in user input",
     )
 
+    assert "dsl_json" in prompt
+    assert "不要输出 dsl object" in prompt
     assert "不要输出 parse_confidence" in prompt
     assert "risk.stop_loss 必须是数字比例" in prompt
     assert 'selection.score 必须是 {"factor":"RETURN_N","params":[20]}' in prompt
     assert "股票代码和股票池必须来自原始用户策略" in prompt
-    assert '如果无法在契约内表达，请返回 dsl={}, strategy_kind="unsupported"' in prompt
+    assert '如果无法在契约内表达，请返回 dsl_json="{}", strategy_kind="unsupported"' in prompt
 
 
 def test_user_prompt_includes_few_shot_examples_for_fragile_shapes():
     prompt = _build_user_prompt("每月选过去20日涨幅最高的10只股票等权持有。")
 
     assert "参考示例" in prompt
-    assert '"stop_loss": 0.08' in prompt
-    assert '"factor": "RETURN_N"' in prompt
+    assert '"dsl_json": "{\\"strategy_kind\\":\\"timeseries\\",' in prompt
+    assert '\\"stop_loss\\":0.08' in prompt
+    assert '\\"factor\\":\\"RETURN_N\\"' in prompt
     assert '"strategy_kind": "unsupported"' in prompt
     assert '"pool_name": "CSI300"' in prompt
 

@@ -302,6 +302,11 @@ def test_case_9b_parser_contract_error_returns_validation_error_without_running_
 
 
 def test_case_10_timeseries_and_cross_sectional_share_qlib_target_weight_adapter():
+    pytest.importorskip(
+        "qlib.strategy.base",
+        reason="Qlib target-weight adapter golden case requires qlib to be installed",
+    )
+
     provider = AdapterFakeProvider()
     timeseries_strategy = compile_strategy(_valid_timeseries_parse_result().dsl)
     cross_sectional_strategy = compile_strategy(_valid_cross_sectional_parse_result().dsl)

@@ -85,6 +85,18 @@ class LLMParseDraft(BaseModel):
     human_summary: str = ""
 
 
+class LLMParseDraftWire(BaseModel):
+    """Strict structured-output wire format returned by the LLM."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    dsl_json: str
+    strategy_kind: Literal["timeseries", "cross_sectional", "unsupported"]
+    assumptions: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    human_summary: str = ""
+
+
 @dataclass(frozen=True)
 class OpenAICompatibleLLMClient:
     settings: Settings
@@ -235,10 +247,9 @@ def llm_parse_draft_json_schema() -> dict[str, Any]:
     return {
         "type": "object",
         "properties": {
-            "dsl": {
-                "type": "object",
-                "description": "Controlled NLTrader DSL object. Empty object when unsupported.",
-                "additionalProperties": True,
+            "dsl_json": {
+                "type": "string",
+                "description": "JSON string for the controlled NLTrader DSL object. Use '{}' when unsupported.",
             },
             "strategy_kind": {
                 "type": "string",
@@ -255,7 +266,7 @@ def llm_parse_draft_json_schema() -> dict[str, Any]:
             "human_summary": {"type": "string"},
         },
         "required": [
-            "dsl",
+            "dsl_json",
             "strategy_kind",
             "assumptions",
             "warnings",
@@ -274,6 +285,44 @@ def parse_llm_draft_from_text(raw_text: str) -> LLMParseDraft:
     if not isinstance(data, dict):
         raise LLMOutputContractError("LLM output must be a JSON object")
 
+    if "dsl_json" in data:
+        return _parse_wire_draft(data)
+
+    if "dsl" in data:
+        return _parse_legacy_object_draft(data)
+
+    raise LLMOutputContractError("LLM output must include dsl_json")
+
+
+def _parse_wire_draft(data: dict[str, Any]) -> LLMParseDraft:
+    try:
+        wire = LLMParseDraftWire.model_validate(data)
+    except PydanticValidationError as exc:
+        raise LLMOutputContractError(f"invalid LLMParseDraftWire schema: {exc}") from exc
+
+    try:
+        dsl = json.loads(wire.dsl_json)
+    except json.JSONDecodeError as exc:
+        raise LLMOutputContractError(f"dsl_json is not valid JSON: {exc}") from exc
+
+    if not isinstance(dsl, dict):
+        raise LLMOutputContractError("dsl_json must decode to a JSON object")
+
+    try:
+        return LLMParseDraft.model_validate(
+            {
+                "dsl": dsl,
+                "strategy_kind": wire.strategy_kind,
+                "assumptions": wire.assumptions,
+                "warnings": wire.warnings,
+                "human_summary": wire.human_summary,
+            }
+        )
+    except PydanticValidationError as exc:
+        raise LLMOutputContractError(f"invalid LLMParseDraft schema: {exc}") from exc
+
+
+def _parse_legacy_object_draft(data: dict[str, Any]) -> LLMParseDraft:
     try:
         return LLMParseDraft.model_validate(data)
     except PydanticValidationError as exc:
@@ -283,10 +332,15 @@ def parse_llm_draft_from_text(raw_text: str) -> LLMParseDraft:
 def _parse_draft_with_contract(raw: str, *, source_text: str) -> LLMParseDraft:
     draft = parse_llm_draft_from_text(raw)
 
-    if draft.strategy_kind == "unsupported" or not draft.dsl:
-        if draft.dsl:
-            raise LLMOutputContractError("unsupported draft must use empty dsl")
+    if not draft.dsl:
+        if draft.strategy_kind != "unsupported":
+            raise LLMOutputContractError(
+                "empty dsl requires strategy_kind='unsupported'"
+            )
         return draft
+
+    if draft.strategy_kind == "unsupported":
+        raise LLMOutputContractError("unsupported draft must use empty dsl")
 
     dsl = dict(draft.dsl)
     try:
@@ -383,7 +437,8 @@ def _build_system_prompt() -> str:
 支持操作符: {", ".join(sorted(SUPPORTED_OPERATORS))}。
 支持调仓频率: {", ".join(sorted(SUPPORTED_REBALANCE_FREQUENCIES))}。
 股票代码必须输出 Qlib 风格，如 SH600036、SZ000001。
-输出 JSON 顶层字段只能是: dsl, strategy_kind, assumptions, warnings, human_summary。
+输出 JSON 顶层字段只能是: dsl_json, strategy_kind, assumptions, warnings, human_summary。
+其中 dsl_json 必须是 DSL JSON 字符串，不要输出 dsl object。
 不要输出 parse_confidence；parse_confidence 由后端 parser 计算。
 不要输出 Python 代码、Qlib YAML、Qlib 表达式、markdown 或 JSON 外文本。
 
@@ -396,7 +451,7 @@ def _build_system_prompt() -> str:
 - 不要编造用户没有明确给出的股票代码、股票池或指数池。
 
 缺少必要信息时返回 unsupported + 空 DSL + warnings。
-超出支持范围或缺少必要 universe 时，返回 dsl={{}}, strategy_kind="unsupported"，并在 warnings 说明原因。
+超出支持范围或缺少必要 universe 时，返回 dsl_json="{{}}", strategy_kind="unsupported"，并在 warnings 说明原因。
 不支持分钟级、公告/财报事件驱动、做空、杠杆。
 输出必须是 LLMParseDraft JSON 对象。"""
 
@@ -406,13 +461,14 @@ def _build_user_prompt(text: str) -> str:
 
 LLMParseDraft 顶层结构：
 {{
-  "dsl": {{}},
+  "dsl_json": "{{}}",
   "strategy_kind": "timeseries" | "cross_sectional" | "unsupported",
   "assumptions": [],
   "warnings": [],
   "human_summary": ""
 }}
 
+其中 dsl_json 是 DSL JSON 字符串。unsupported 时 dsl_json 必须是 "{{}}"。不要输出 dsl object。
 DSL timeseries 结构包含 strategy_kind, market, frequency, universe, rebalance, signal(entry_rules/exit_rules), 可选 risk(stop_loss)。
 DSL cross_sectional 结构包含 strategy_kind, market, frequency, universe, rebalance, selection(filters/score/rank_order/top_n 或 bottom_n), construction(weighting="equal_weight")。
 规则表达式只能用 lhs/op/rhs；表达式只能用 indicator/params 或 value。
@@ -448,14 +504,15 @@ def _build_repair_prompt(
 {validation_error}
 
 必须满足：
-- 顶层字段只能是 dsl, strategy_kind, assumptions, warnings, human_summary。
+- 顶层字段只能是 dsl_json, strategy_kind, assumptions, warnings, human_summary。
+- dsl_json 必须是 DSL JSON 字符串，不要输出 dsl object。
 - 不要输出 parse_confidence。
 - risk.stop_loss 必须是数字比例，例如亏损8% => 0.08。
 - selection.score 必须是 {{"factor":"RETURN_N","params":[20]}}，不能使用 indicator。
 - params 必须是数组，不能是 {{"n":20}}。
 - 表达式 value 只能是数字或 bool，不能是字符串表达式。
 - 股票代码和股票池必须来自原始用户策略；缺少股票池/股票代码时不要编造。
-- 如果无法在契约内表达，请返回 dsl={{}}, strategy_kind="unsupported" 并写 warnings。
+- 如果无法在契约内表达，请返回 dsl_json="{{}}", strategy_kind="unsupported" 并写 warnings。
 """
 
 
@@ -464,24 +521,7 @@ def _build_few_shot_examples() -> str:
 输入：针对招商银行600036，5日均线上穿20日均线买入，亏损8%卖出。
 输出：
 {
-  "dsl": {
-    "strategy_kind": "timeseries",
-    "market": "CN_A",
-    "frequency": "D",
-    "universe": {"type": "single_symbol", "symbols": ["SH600036"]},
-    "rebalance": {"freq": "daily"},
-    "signal": {
-      "entry_rules": [
-        {
-          "lhs": {"indicator": "SMA", "params": [5]},
-          "op": "cross_above",
-          "rhs": {"indicator": "SMA", "params": [20]}
-        }
-      ],
-      "exit_rules": []
-    },
-    "risk": {"stop_loss": 0.08}
-  },
+  "dsl_json": "{\\"strategy_kind\\":\\"timeseries\\",\\"market\\":\\"CN_A\\",\\"frequency\\":\\"D\\",\\"universe\\":{\\"type\\":\\"single_symbol\\",\\"symbols\\":[\\"SH600036\\"]},\\"rebalance\\":{\\"freq\\":\\"daily\\"},\\"signal\\":{\\"entry_rules\\":[{\\"lhs\\":{\\"indicator\\":\\"SMA\\",\\"params\\":[5]},\\"op\\":\\"cross_above\\",\\"rhs\\":{\\"indicator\\":\\"SMA\\",\\"params\\":[20]}}],\\"exit_rules\\":[]},\\"risk\\":{\\"stop_loss\\":0.08}}",
   "strategy_kind": "timeseries",
   "assumptions": [],
   "warnings": [],
@@ -492,20 +532,7 @@ def _build_few_shot_examples() -> str:
 输入：每月调仓，在股票池600036、000001、600519中选择过去20日涨幅最高的2只股票等权持有。
 输出：
 {
-  "dsl": {
-    "strategy_kind": "cross_sectional",
-    "market": "CN_A",
-    "frequency": "D",
-    "universe": {"type": "symbol_list", "symbols": ["SH600036", "SZ000001", "SH600519"]},
-    "rebalance": {"freq": "monthly"},
-    "selection": {
-      "filters": [],
-      "score": {"factor": "RETURN_N", "params": [20]},
-      "rank_order": "desc",
-      "top_n": 2
-    },
-    "construction": {"weighting": "equal_weight"}
-  },
+  "dsl_json": "{\\"strategy_kind\\":\\"cross_sectional\\",\\"market\\":\\"CN_A\\",\\"frequency\\":\\"D\\",\\"universe\\":{\\"type\\":\\"symbol_list\\",\\"symbols\\":[\\"SH600036\\",\\"SZ000001\\",\\"SH600519\\"]},\\"rebalance\\":{\\"freq\\":\\"monthly\\"},\\"selection\\":{\\"filters\\":[],\\"score\\":{\\"factor\\":\\"RETURN_N\\",\\"params\\":[20]},\\"rank_order\\":\\"desc\\",\\"top_n\\":2},\\"construction\\":{\\"weighting\\":\\"equal_weight\\"}}",
   "strategy_kind": "cross_sectional",
   "assumptions": [],
   "warnings": [],
@@ -516,7 +543,7 @@ def _build_few_shot_examples() -> str:
 输入：每月选过去20日涨幅最高的10只股票等权持有。
 输出：
 {
-  "dsl": {},
+  "dsl_json": "{}",
   "strategy_kind": "unsupported",
   "assumptions": [],
   "warnings": ["缺少明确股票池、股票列表或指数池，无法执行横截面选股。"],
@@ -668,6 +695,12 @@ def _assert_grounded_in_input(dsl: dict[str, Any], source_text: str) -> None:
             raise LLMOutputContractError(
                 "LLM invented preset_pool not explicitly mentioned in user input"
             )
+        canonical_pool_name = _canonical_preset_pool_name(universe.get("pool_name"))
+        if canonical_pool_name is not None:
+            universe["pool_name"] = canonical_pool_name
+        canonical_qlib_market = _canonical_preset_pool_name(universe.get("qlib_market"))
+        if canonical_qlib_market is not None:
+            universe["qlib_market"] = canonical_qlib_market
 
 
 def _reject_unsafe_rule_values(rules: Any, path: str) -> None:
@@ -850,14 +883,25 @@ def _extract_preset_pool_mentions(text: str) -> set[str]:
     return mentions
 
 
+def _canonical_preset_pool_name(value: object) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+
+    lowered = value.strip().lower()
+    compact = re.sub(r"\s+", "", lowered)
+
+    for canonical, aliases in _PRESET_POOL_ALIASES.items():
+        for alias in aliases | {canonical}:
+            alias_lower = alias.strip().lower()
+            alias_compact = re.sub(r"\s+", "", alias_lower)
+            if lowered == alias_lower or compact == alias_compact:
+                return canonical
+    return None
+
+
 def _pool_name_matches_mention(pool_value: object, mentioned_pools: set[str]) -> bool:
-    if not isinstance(pool_value, str) or not pool_value.strip():
-        return False
-    normalized = re.sub(r"[^a-z0-9]", "", pool_value.lower())
-    for canonical in mentioned_pools:
-        if normalized == re.sub(r"[^a-z0-9]", "", canonical.lower()):
-            return True
-    return False
+    canonical = _canonical_preset_pool_name(pool_value)
+    return canonical in mentioned_pools
 
 
 def _chat_completion_endpoint(api_base: str) -> str:
@@ -872,7 +916,21 @@ def _chat_completion_endpoint(api_base: str) -> str:
 def _looks_like_schema_unsupported(status_code: int, error_body: str) -> bool:
     if status_code not in {400, 422}:
         return False
+
     lowered = error_body.lower()
-    return "response_format" in lowered and (
-        "json_schema" in lowered or "strict" in lowered or "unsupported" in lowered
+    compact = re.sub(r"[^a-z0-9]+", "", lowered)
+
+    if "response_format" not in lowered and "responseformat" not in compact:
+        return False
+
+    schema_error_tokens = (
+        "json_schema",
+        "jsonschema",
+        "strict",
+        "unsupported",
+        "invalid schema",
+        "schema",
+        "additionalproperties",
+        "additional properties",
     )
+    return any(token in lowered or token in compact for token in schema_error_tokens)
